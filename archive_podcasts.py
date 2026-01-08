@@ -165,6 +165,7 @@ async def download_episode(
                     progress_bar.total = total_size
                 
                 # Download file
+                print(f"[{episode_index + 1}/{total_episodes}] Downloading: {filename}")
                 downloaded = 0
                 async with aiofiles.open(file_path, 'wb') as f:
                     async for chunk in response.aiter_bytes(chunk_size=8192):
@@ -182,42 +183,53 @@ async def download_episode(
             return False
 
 
-async def main():
-    parser = argparse.ArgumentParser(
-        description="Download podcast episodes with concurrent downloads and progress tracking",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  python archive_podcasts.py -u "https://example.com/feed.xml" -o "./downloads"
-  python archive_podcasts.py -u "https://example.com/feed.xml" -o "./downloads" -t 5
-  python archive_podcasts.py -u "https://example.com/feed.xml" -o "./downloads" -c 10 -m
-        """
-    )
-    
-    parser.add_argument('-u', '--url', required=True, help='RSS feed URL')
-    parser.add_argument('-o', '--output', required=True, help='Output directory')
-    parser.add_argument('-c', '--count', type=int, help='Number of episodes to download')
-    parser.add_argument('-f', '--offset', type=int, help='Number of episodes to skip',default=0)    
-    parser.add_argument('-t', '--threads', type=int, default=1, help='Number of concurrent downloads (default: 1)')
-    parser.add_argument('-m', '--metadata', action='store_true', help='Save episode metadata as JSON files')
-    
-    args = parser.parse_args()
-    
-    print("Podcast Archiver - Downloading episodes...")
-    
+def load_urls_from_file(file_path: str) -> List[str]:
+    """Load URLs from a file (one per line)"""
+    urls = []
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                # Skip empty lines and comments
+                if line and not line.startswith('#'):
+                    urls.append(line)
+    except FileNotFoundError:
+        print(f"Error: File not found: {file_path}")
+        sys.exit(1)
+    except Exception as e:
+        print(f"Error reading file {file_path}: {e}")
+        sys.exit(1)
+    return urls
+
+
+async def process_podcast_feed(
+    feed_url: str,
+    output_dir: str,
+    count: Optional[int],
+    offset: int,
+    threads: int,
+    save_metadata_flag: bool,
+    feed_index: int = 1,
+    total_feeds: int = 1
+) -> tuple[int, int]:
+    """Process a single podcast feed and download episodes"""
     # Parse RSS feed
-    print(f"Fetching RSS feed: {args.url}")
-    feed = feedparser.parse(args.url)
+    if total_feeds > 1:
+        print(f"\n[{feed_index}/{total_feeds}] Fetching RSS feed: {feed_url}")
+    else:
+        print(f"Fetching RSS feed: {feed_url}")
+    
+    feed = feedparser.parse(feed_url)
     
     if not feed.entries:
-        print("Error: No episodes found in RSS feed")
-        return
+        print(f"Error: No episodes found in RSS feed: {feed_url}")
+        return (0, 0)
     
     podcast_title = feed.feed.title if hasattr(feed.feed, 'title') else "Unknown Podcast"
     print(f"[{podcast_title}] Found {len(feed.entries)} episodes")
     
     # Create output directory
-    podcast_dir = os.path.join(args.output, podcast_title)
+    podcast_dir = os.path.join(output_dir, podcast_title)
     os.makedirs(podcast_dir, exist_ok=True)
     
     # Filter episodes with enclosures
@@ -227,18 +239,18 @@ Examples:
             episodes_with_enclosures.append(entry)
     
     if not episodes_with_enclosures:
-        print("Error: No episodes with downloadable content found")
-        return
+        print(f"Error: No episodes with downloadable content found in {podcast_title}")
+        return (0, 0)
     
     # Limit episodes if specified
-    max_episodes = args.count if args.count else len(episodes_with_enclosures)
-    initial_offset = args.offset if args.offset else 0
+    max_episodes = count if count else len(episodes_with_enclosures)
+    initial_offset = offset if offset else 0
     episodes_to_download = episodes_with_enclosures[initial_offset:initial_offset + max_episodes]
     
-    print(f"Downloading {len(episodes_to_download)} episodes with {args.threads} threads")
+    print(f"Downloading {len(episodes_to_download)} episodes with {threads} threads")
     
     # Create semaphore for concurrency control
-    semaphore = asyncio.Semaphore(args.threads)
+    semaphore = asyncio.Semaphore(threads)
     
     # Prepare download tasks
     tasks = []
@@ -265,7 +277,7 @@ Examples:
             
             # Extract metadata if needed
             metadata = None
-            if args.metadata:
+            if save_metadata_flag:
                 metadata = extract_metadata(entry)
             
             # Create download task
@@ -277,7 +289,7 @@ Examples:
                 episode_index=i,
                 total_episodes=len(episodes_to_download),
                 semaphore=semaphore,
-                save_metadata_flag=args.metadata,
+                save_metadata_flag=save_metadata_flag,
                 metadata=metadata
             )
             tasks.append(task)
@@ -289,10 +301,112 @@ Examples:
         successful = sum(1 for result in results if result is True)
         failed = len(results) - successful
         
-        print(f"\nDownload complete!")
-        print(f"Successfully downloaded: {successful}")
-        if failed > 0:
-            print(f"Failed downloads: {failed}")
+        return (successful, failed)
+
+
+async def main():
+    parser = argparse.ArgumentParser(
+        description="Download podcast episodes with concurrent downloads and progress tracking",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Single podcast URL
+  python archive_podcasts.py -u "https://example.com/feed.xml" -d "./downloads"
+  
+  # Multiple podcast URLs
+  python archive_podcasts.py -u "https://example.com/feed1.xml" -u "https://example.com/feed2.xml" -d "./downloads"
+  
+  # URLs from a file (one URL per line)
+  python archive_podcasts.py -f "podcasts.txt" -d "./downloads"
+  
+  # With additional options
+  python archive_podcasts.py -u "https://example.com/feed.xml" -d "./downloads" -t 5 -c 10 -m
+  
+  # Run in continuous loop (check every hour)
+  python archive_podcasts.py -u "https://example.com/feed.xml" -d "./downloads" -s 3600
+        """
+    )
+    
+    url_group = parser.add_mutually_exclusive_group(required=True)
+    url_group.add_argument('-u', '--url', action='append', help='RSS feed URL (can be specified multiple times)')
+    url_group.add_argument('-f', '--urls-file', help='File containing RSS feed URLs (one per line)')
+    
+    parser.add_argument('-d', '--directory', required=True, help='Output directory')
+    parser.add_argument('-c', '--count', type=int, help='Number of episodes to download per feed')
+    parser.add_argument('-o', '--offset', type=int, help='Number of episodes to skip', default=0)    
+    parser.add_argument('-t', '--threads', type=int, default=1, help='Number of concurrent downloads (default: 1)')
+    parser.add_argument('-m', '--metadata', action='store_true', help='Save episode metadata as JSON files')
+    parser.add_argument('-s', '--sleep-seconds', type=int, help='Run in a loop, sleeping for specified seconds between iterations')
+    
+    args = parser.parse_args()
+
+    loop_mode = args.sleep_seconds is not None
+    
+    if loop_mode:
+        print(f"Processing podcast feeds every {args.sleep_seconds} seconds")
+    
+    iteration = 0
+    
+    try:
+        while True:
+            iteration += 1
+            if loop_mode:
+                current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                print(f"\n{'='*60}")
+                print(f"Iteration #{iteration} - {current_time}")
+                print(f"{'='*60}\n")
+
+            # Collect all URLs
+            urls = []
+            if args.urls_file:
+                urls = load_urls_from_file(args.urls_file)
+                if not urls:
+                    print("Error: No URLs found in file")
+                    return
+            elif args.url:
+                urls = args.url
+            
+            if urls:
+                print(f"Processing {len(urls)} podcast feeds")
+
+                # Process each feed sequentially
+                total_successful = 0
+                total_failed = 0
+                
+                for i, feed_url in enumerate(urls, 1):
+                    successful, failed = await process_podcast_feed(
+                        feed_url=feed_url,
+                        output_dir=args.directory,
+                        count=args.count,
+                        offset=args.offset,
+                        threads=args.threads,
+                        save_metadata_flag=args.metadata,
+                        feed_index=i,
+                        total_feeds=len(urls)
+                    )
+                    total_successful += successful
+                    total_failed += failed
+                
+                print(f"\n{'='*60}")
+                print(f"Iteration #{iteration} complete!")
+                print(f"Total successfully downloaded: {total_successful}")
+                if total_failed > 0:
+                    print(f"Total failed downloads: {total_failed}")
+                print(f"{'='*60}")
+            else:
+                print("Error: No URLs provided")
+            
+            if not loop_mode:
+                break
+
+            # Sleep before next iteration
+            print(f"\nSleeping for {args.sleep_seconds} seconds... (Press Ctrl+C to stop)", flush=True)
+            await asyncio.sleep(args.sleep_seconds)
+            
+    except KeyboardInterrupt:
+        if loop_mode:
+            print(f"\n\nLoop interrupted by user after {iteration} iteration(s)")
+        raise
 
 
 if __name__ == "__main__":
