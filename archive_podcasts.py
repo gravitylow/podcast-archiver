@@ -2,7 +2,7 @@
 
 import argparse
 import asyncio
-import aiohttp
+import httpx
 import aiofiles
 import feedparser
 import json
@@ -120,7 +120,7 @@ async def save_metadata(metadata: EpisodeMetadata, output_dir: str, filename: st
 
 
 async def download_episode(
-    session: aiohttp.ClientSession,
+    session: httpx.AsyncClient,
     url: str,
     filename: str,
     output_dir: str,
@@ -150,9 +150,9 @@ async def download_episode(
                 leave=False
             )
             
-            async with session.get(url) as response:
-                if response.status != 200:
-                    print(f"Error downloading {filename}: HTTP {response.status}")
+            async with session.stream('GET', url) as response:
+                if response.status_code != 200:
+                    print(f"Error downloading {filename}: HTTP {response.status_code}")
                     return False
 
                 # Save metadata if enabled
@@ -167,7 +167,7 @@ async def download_episode(
                 # Download file
                 downloaded = 0
                 async with aiofiles.open(file_path, 'wb') as f:
-                    async for chunk in response.content.iter_chunked(8192):
+                    async for chunk in response.aiter_bytes(chunk_size=8192):
                         await f.write(chunk)
                         downloaded += len(chunk)
                         progress_bar.update(len(chunk))
@@ -197,6 +197,7 @@ Examples:
     parser.add_argument('-u', '--url', required=True, help='RSS feed URL')
     parser.add_argument('-o', '--output', required=True, help='Output directory')
     parser.add_argument('-c', '--count', type=int, help='Number of episodes to download')
+    parser.add_argument('-f', '--offset', type=int, help='Number of episodes to skip',default=0)    
     parser.add_argument('-t', '--threads', type=int, default=1, help='Number of concurrent downloads (default: 1)')
     parser.add_argument('-m', '--metadata', action='store_true', help='Save episode metadata as JSON files')
     
@@ -231,7 +232,8 @@ Examples:
     
     # Limit episodes if specified
     max_episodes = args.count if args.count else len(episodes_with_enclosures)
-    episodes_to_download = episodes_with_enclosures[:max_episodes]
+    initial_offset = args.offset if args.offset else 0
+    episodes_to_download = episodes_with_enclosures[initial_offset:initial_offset + max_episodes]
     
     print(f"Downloading {len(episodes_to_download)} episodes with {args.threads} threads")
     
@@ -240,7 +242,7 @@ Examples:
     
     # Prepare download tasks
     tasks = []
-    async with aiohttp.ClientSession() as session:
+    async with httpx.AsyncClient(follow_redirects=True) as session:
         for i, entry in enumerate(episodes_to_download):
             if i >= max_episodes:
                 break
